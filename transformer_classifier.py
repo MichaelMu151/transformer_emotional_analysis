@@ -56,25 +56,48 @@ class PositionalEncoding(nn.Module):
 
 # ---------- 3. 多头自注意力（核心组件） ----------
 class MultiHeadAttention(nn.Module):
+    """
+    结构拆解：
+        输入 x (B, L, D)
+            -> Q/K/V 线性变换 (保留维度 D)
+            -> 拆分为 H 个头 (B, H, L, D_h)
+            -> 批量矩阵乘法计算注意力分数 (B, H, L, L)
+            -> 缩放 + Softmax + Dropout
+            -> 与 V 加权求和 (B, H, L, D_h)
+            -> 合并多头 (B, L, D)
+            -> 输出投影 (B, L, D)
+    """
     def __init__(self, d_model, n_heads, dropout=0.1):
         super().__init__()
+        # ---- 可整除性约束（硬性要求） ----
+        # 如果 d_model 不能被 n_heads 整除，后续 view 操作会因形状不匹配而崩溃。
         assert d_model % n_heads == 0, "d_model 必须能被 n_heads 整除"
-
+        
         self.d_model = d_model
         self.n_heads = n_heads
-        self.d_k = d_model // n_heads
+        self.d_k = d_model // n_heads  # 每个头的维度，典型值 64
 
+        # ---- 四个线性投影层 ----
+        # 为什么保留 bias=True？
+        #   虽然现代大模型（如 LLaMA）为省显存常禁用偏置，
+        #   但在微调（Fine-tuning）场景中，偏置提供了额外的平移自由度，
+        #   能提升分类任务的准确率。这里选择“最大功率”配置。
         self.W_q = nn.Linear(d_model, d_model, bias=True)
         self.W_k = nn.Linear(d_model, d_model, bias=True)
         self.W_v = nn.Linear(d_model, d_model, bias=True)
-        self.W_o = nn.Linear(d_model, d_model, bias=True)
-
+        self.W_o = nn.Linear(d_model, d_model, bias=True)  # 多头融合层
+        
         self.dropout = nn.Dropout(dropout)
 
+        # ---- 权重初始化（深层网络的救命稻草） ----
+        # Xavier 均匀初始化：保持前向传播时每层输出的方差一致，
+        # 防止信号在深层网络中指数级衰减或爆炸。
+        # 配合 GeLU 激活函数，这是最稳妥的初始化策略。
         nn.init.xavier_uniform_(self.W_q.weight)
         nn.init.xavier_uniform_(self.W_k.weight)
         nn.init.xavier_uniform_(self.W_v.weight)
         nn.init.xavier_uniform_(self.W_o.weight)
+        # 偏置初始化为 0，让模型从“对称”状态开始学习
         if self.W_q.bias is not None:
             nn.init.constant_(self.W_q.bias, 0)
             nn.init.constant_(self.W_k.bias, 0)
@@ -82,45 +105,164 @@ class MultiHeadAttention(nn.Module):
             nn.init.constant_(self.W_o.bias, 0)
 
     def forward(self, x, mask=None):
+        """
+        输入:
+            x: (batch_size, seq_len, d_model)
+            mask: (batch_size, seq_len) 或 (batch_size, 1, 1, seq_len)
+                  1 表示有效位置，0 表示填充位置（PAD）
+        
+        返回:
+            output: (batch_size, seq_len, d_model)
+        """
         batch_size, seq_len, _ = x.size()
 
+        # ========== 步骤 1：线性变换并拆分为多头 ==========
+        # 操作：D -> H * D_k，然后重排为 (B, H, L, D_k)
+        # 为什么先 view 再 transpose？
+        #   view 负责物理内存重排，transpose 负责逻辑维度交换，
+        #   二者配合将“头数”维度提前，便于后续批量并行计算。
         Q = self.W_q(x).view(batch_size, seq_len, self.n_heads, self.d_k).transpose(1, 2)
         K = self.W_k(x).view(batch_size, seq_len, self.n_heads, self.d_k).transpose(1, 2)
         V = self.W_v(x).view(batch_size, seq_len, self.n_heads, self.d_k).transpose(1, 2)
+        # 此时 Q/K/V 形状均为: (B, H, L, D_k)
 
+        # ========== 步骤 2：计算缩放点积注意力分数 ==========
+        # scores = (Q @ K^T) / sqrt(d_k)
+        # K.transpose(-2, -1) 将 (B, H, L, D_k) 变为 (B, H, D_k, L)
+        # matmul 结果: (B, H, L, L)，第 i 行第 j 列表示第 i 个 Token 对第 j 个 Token 的原始关注强度。
         scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.d_k)
 
+        # ---- 为什么要除以 sqrt(d_k)？（数学救命项） ----
+        # 假设 Q 和 K 都是标准正态分布（均值为0，方差为1），
+        # 则 Q·K 的方差 = d_k。若 d_k=64，标准差为8。
+        # 这么大的输入值会让 Softmax 进入梯度极度饱和区（接近0），
+        # 导致训练时梯度消失，模型无法更新。
+        # 除以 sqrt(d_k) 将方差拉回 1，保持梯度在敏感区间。
+
+        # ========== 步骤 3：掩码（Mask）处理 ==========
+        # 将填充（PAD）位置的分数设为极小的负数（-1e9），
+        # 这样在 Softmax 后 e^(-1e9) ≈ 0，权重忽略这些位置。
         if mask is not None:
+            # mask 形状适配：确保能广播到 (B, H, L, L)
+            # 原始 mask 为 (B, L)，需扩展为 (B, 1, 1, L) 或 (B, 1, L, L)
             if mask.dim() == 2:
-                mask = mask.unsqueeze(1).unsqueeze(2)
+                mask = mask.unsqueeze(1).unsqueeze(2)  # (B, 1, 1, L)
             scores = scores.masked_fill(mask == 0, -1e9)
 
-        attn_weights = F.softmax(scores, dim=-1)
-        attn_weights = self.dropout(attn_weights)
+        # ========== 步骤 4：Softmax 归一化 + Dropout ==========
+        # dim=-1 表示在“序列长度”维度上归一化，确保每行的注意力权重之和为1。
+        attn_weights = F.softmax(scores, dim=-1)  # (B, H, L, L)
+        attn_weights = self.dropout(attn_weights)  # 正则化，防止过拟合
 
+        # ========== 步骤 5：加权求和（提取上下文信息） ==========
+        # 用注意力权重对 V 进行加权聚合。
+        # 形状变化: (B, H, L, L) @ (B, H, L, D_k) -> (B, H, L, D_k)
         context = torch.matmul(attn_weights, V)
+
+        # ========== 步骤 6：合并多头（融合子空间特征） ==========
+        # 1. transpose(1, 2): (B, H, L, D_k) -> (B, L, H, D_k)
+        # 2. contiguous(): 让内存连续（因为 transpose 只返回视图，逻辑连续但物理不连续）
+        # 3. view(): 将 (B, L, H, D_k) 展平为 (B, L, H*D_k) = (B, L, D_model)
+        #
+        # ---- 致命陷阱：忘记 contiguous() ----
+        # transpose 操作在 PyTorch 中不会改变内存布局，只改变步长（stride）。
+        # 如果直接调用 .view()，会抛错：
+        #   RuntimeError: view size is not compatible with input tensor.
+        # 必须先 .contiguous() 将数据拷贝到连续内存块中。
         context = context.transpose(1, 2).contiguous().view(batch_size, seq_len, self.d_model)
 
+        # ========== 步骤 7：最终输出投影 ==========
+        # 将多头融合后的特征再做一次线性变换，
+        # 让模型学习“如何混合各头输出的最佳权重”。
         output = self.W_o(context)
         return output
 
 # ---------- 4. 前馈网络（FFN） ----------
+# 宏观定位：对每个 Token 的向量独立进行“深度内省”式的非线性变换。
+# 职责分工：
+#   - 多头注意力：负责“词与词之间的上下文融合”（社交）。
+#   - FFN：负责“当前词自身的特征提纯”（内省）。
+# 数学本质：一个具有单隐层的全连接网络，其隐藏层维度 d_ff 通常为 d_model 的 4 倍。
+#          它占据了 Transformer 模型总参数量的约 2/3。
+# ============================================================================
 class FeedForward(nn.Module):
+    """
+    结构拆解（沙漏型）：
+        输入 (batch, seq_len, d_model)
+            -> 线性层1（升维）: (batch, seq_len, d_ff)
+            -> GeLU 激活函数（非线性门控）
+            -> 线性层2（降维）: (batch, seq_len, d_model)
+    
+    关键数学特性：
+        - 升维（D -> 4D）：在高维空间中寻找线性可分的特征表示（Cover 定理）。
+        - 降维（4D -> D）：通过线性组合将高维特征聚合回统一语义空间。
+    """
     def __init__(self, d_model, d_ff, dropout=0.1):
         super().__init__()
+        
+        # ---- 第一层线性层（膨胀/升维） ----
+        # 作用：将低维（512）特征投射到高维（2048）过完备空间。
+        # 参数数量：d_model * d_ff（约 100 万参数，占总参数的 1/3）。
         self.linear1 = nn.Linear(d_model, d_ff)
+        
+        # ---- 第二层线性层（压缩/降维） ----
+        # 作用：将高维激活特征重新聚合回低维（512）表征空间。
+        # 参数数量：d_ff * d_model（约 100 万参数，占总参数的 1/3）。
         self.linear2 = nn.Linear(d_ff, d_model)
+        
+        # ---- Dropout 正则化 ----
+        # 作用：在训练时随机丢弃一部分神经元，防止 FFN 过拟合训练集。
+        # 注意：由于 FFN 参数量巨大（2/3 总参数），此处的 Dropout 至关重要。
         self.dropout = nn.Dropout(dropout)
 
+        # ---- 权重初始化（Xavier 均匀分布） ----
+        # 数学依据：Xavier 初始化保证前向传播时，每层输出的方差与输入的方差一致。
+        # 若不显式初始化，PyTorch 默认使用 Kaiming 初始化（针对 ReLU 设计），
+        # 而 Transformer 配合 GeLU 时，Xavier 能提供更稳定的梯度流。
         nn.init.xavier_uniform_(self.linear1.weight)
         nn.init.xavier_uniform_(self.linear2.weight)
+        
+        # 偏置初始化为 0，让模型从对称状态开始学习。
         nn.init.constant_(self.linear1.bias, 0)
         nn.init.constant_(self.linear2.bias, 0)
 
     def forward(self, x):
-        x = self.dropout(F.gelu(self.linear1(x)))
-        x = self.linear2(x)
-        return x
+        """
+        前向传播数学链条：
+            x (B, L, D) 
+                -> H = x @ W1^T + b1  (B, L, D_ff)   [升维]
+                -> A = GeLU(H)         (B, L, D_ff)   [非线性门控]
+                -> A = Dropout(A)      (B, L, D_ff)   [正则化]
+                -> Y = A @ W2^T + b2   (B, L, D)      [降维]
+        
+        梯度流动的生死命门（关键点）：
+            反向传播时，误差信号经过 GeLU 的导数。
+            若使用 ReLU，当 H < 0 时导数为 0，梯度彻底中断，造成神经元死亡。
+            本代码选用 GeLU，其在全实数域导数 > 0（即使负值区域也保留极小梯度 0.1x），
+            保证了梯度在深层网络中能持续反向流动。
+        """
+        # ---- 步骤 1：升维（低维 -> 高维） ----
+        # 线性变换：将隐层特征从 d_model 映射到 d_ff 维度。
+        # 物理意义：为当前 Token 提供“草稿纸”，把模糊的语义拆解成 2048 个碎片候选。
+        h = self.linear1(x)  # (batch, seq_len, d_ff)
+        
+        # ---- 步骤 2：GeLU 激活（非线性筛子） ----
+        # 为什么必须使用 GeLU？
+        #   1. 非线性：若没有激活，两层线性层等价于单层线性（秩坍缩），无法逼近复杂函数。
+        #   2. 非零梯度：在负数区域，GeLU 依然保留微弱梯度（不像 ReLU 直接截断）。
+        #      这保证了模型在深度堆叠时不会出现大面积的神经元死亡。
+        # 公式近似：GeLU(x) ≈ 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+        a = F.gelu(h)  # (batch, seq_len, d_ff)
+        
+        # ---- 步骤 3：Dropout（正则化） ----
+        a = self.dropout(a)
+        
+        # ---- 步骤 4：降维（高维 -> 低维） ----
+        # 线性变换：将激活后的高维特征聚合回 d_model。
+        # 物理意义：利用高维空间挖掘出的丰富特征，重构出当前 Token 更精确的语义表示。
+        y = self.linear2(a)  # (batch, seq_len, d_model)
+        
+        return y
 
 # ---------- 5. Transformer 编码器块（Pre-LN 架构） ----------
 class TransformerBlock(nn.Module):
