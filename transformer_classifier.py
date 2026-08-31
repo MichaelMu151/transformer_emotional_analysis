@@ -265,28 +265,97 @@ class FeedForward(nn.Module):
         return y
 
 # ---------- 5. Transformer 编码器块（Pre-LN 架构） ----------
+# ============================================================================
+# 宏观定位：构成 Transformer 深度网络的“基本原子单元”。
+# 职责分工：
+#   - 子层 1（多头注意力）：让词与词“社交”（全局上下文融合）。
+#   - 子层 2（前馈网络）：让每个词“内省”（特征提纯与非线性变换）。
+# 架构生死抉择：本模块采用 Pre-LN（前置层归一化），而非原始论文的 Post-LN。
+#   这是现代大模型（GPT、BERT、LLaMA）能够堆叠数千层的根本原因。
+# ============================================================================
 class TransformerBlock(nn.Module):
+    """
+    Pre-LN 架构的“三明治”结构（与 Post-LN 的核心区别）：
+    
+    Post-LN（原始 Transformer，Vaswani et al. 2017）：
+        x -> Attn -> Dropout -> Add -> LN -> FFN -> Add -> LN
+        问题：梯度在深层中需要通过 LayerNorm 的缩放/平移反向传播，
+             极易导致梯度消失或爆炸。
+
+    Pre-LN（本模块采用的现代标准）：
+        x -> LN -> Attn -> Dropout -> Add -> LN -> FFN -> Add
+        优势：梯度可以通过“残差捷径（Add）”直接无损回传，
+             不受 LayerNorm 变换的影响，保证了数十层深度的稳定训练。
+    """
     def __init__(self, d_model, n_heads, d_ff, dropout=0.1):
         super().__init__()
+        
+        # ---- 子层 1：多头自注意力 ----
+        # 负责融合全局上下文信息。
         self.attn = MultiHeadAttention(d_model, n_heads, dropout)
+        
+        # ---- 子层 2：前馈网络 ----
+        # 负责对每个 Token 进行独立的非线性变换（占据 2/3 参数量）。
         self.ffn = FeedForward(d_model, d_ff, dropout)
+        
+        # ---- Pre-LN 的核心：两个独立的层归一化（LayerNorm） ----
+        # 为什么是两个，而不是一个？
+        #   因为 Pre-LN 要求在“进入每个子层之前”都做一次归一化。
+        #   即：进入 Attn 前归一化（norm1），进入 FFN 前归一化（norm2）。
+        #   它们不共享参数，各自学习不同的缩放（scale）与平移（shift）。
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
+        
+        # ---- Dropout（正则化武器） ----
+        # 放在残差分支上，防止模型过度依赖特定路径。
         self.dropout1 = nn.Dropout(dropout)
         self.dropout2 = nn.Dropout(dropout)
 
     def forward(self, x, mask=None):
+        """
+        Pre-LN 前向传播的严格顺序（这是训练稳定性的生死线）：
+        
+        步骤 1：残差连接保存原始输入 -> 归一化 -> 注意力 -> Dropout -> 残差相加
+        步骤 2：残差连接保存当前状态 -> 归一化 -> FFN -> Dropout -> 残差相加
+        
+        维度追踪（假设 x: (B, L, D)）：
+            residual = x                     # (B, L, D)
+            x = self.norm1(x)                # (B, L, D)  [归一化，形状不变]
+            x = self.attn(x, mask)           # (B, L, D)
+            x = self.dropout1(x)             # (B, L, D)
+            x = residual + x                 # (B, L, D)  [残差连接]
+            
+            residual = x                     # (B, L, D)
+            x = self.norm2(x)                # (B, L, D)  [归一化]
+            x = self.ffn(x)                  # (B, L, D)
+            x = self.dropout2(x)             # (B, L, D)
+            x = residual + x                 # (B, L, D)  [残差连接]
+        """
+        # ---- 第一阶段：Pre-LN + 多头注意力 ----
+        # 第一步：先存下原始输入（残差连接的“高速公路”）
         residual = x
+        
+        # 第二步：LayerNorm（这就是“Pre”的含义——在进入子层之前归一化）
         x = self.norm1(x)
+        
+        # 第三步：多头注意力计算（全局上下文融合）
         x = self.attn(x, mask)
+        
+        # 第四步：Dropout 正则化
         x = self.dropout1(x)
+        
+        # 第五步：残差相加（梯度完美无损回传的关键）
+        # 这里执行的是向量加法，操作极其简单，梯度在反向传播时直接复制。
         x = residual + x
 
+        # ---- 第二阶段：Pre-LN + 前馈网络 ----
+        # 完全对称的操作流程
         residual = x
         x = self.norm2(x)
         x = self.ffn(x)
         x = self.dropout2(x)
         x = residual + x
+        
         return x
 
 # ---------- 6. 最强完整模型（分类器） ----------
